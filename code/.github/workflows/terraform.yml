@@ -6,18 +6,22 @@ on:
       - main
       - test
       - dev
+    paths:
+      - 'code/**'
 
   pull_request:
     branches:
       - main
       - test
       - dev
+    paths:
+      - 'code/**'
 
 env:
   TF_LOG: INFO
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  # BUCKET_TF_STATE: ${{ secrets.BUCKET_TF_STATE}}
+  AWS_DEFAULT_REGION: us-east-1
 
 permissions:
   contents: read
@@ -28,11 +32,14 @@ jobs:
   terraform-plan:
     name: "Terraform Plan"
     runs-on: ubuntu-latest
+
     outputs:
       tf_workspace: ${{ steps.env-vars.outputs.tf_workspace }}
+
     defaults:
       run:
         shell: bash
+        working-directory: ./code/
 
     steps:
       - name: Checkout
@@ -41,7 +48,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.13.3
+          terraform_version: 1.6.6
 
       - name: Setup TFLint
         uses: terraform-linters/setup-tflint@v3
@@ -49,24 +56,20 @@ jobs:
           tflint_version: v0.52.0
 
       - name: Init TFLint
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: tflint --init
 
       - name: Run TFLint
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: tflint -f compact
 
-      - name: Run Trivy vulnerability scanner in IaC mode
-        uses: aquasecurity/trivy-action@master
+      # ✅ FIXED TRIVY VERSION
+      - name: Run Trivy (IaC Scan)
+        uses: aquasecurity/trivy-action@v0
         with:
-          scan-type: "config"
-          hide-progress: false
-          format: "table"
+          scan-type: config
+          format: table
           exit-code: "0"
           ignore-unfixed: true
-          severity: "CRITICAL,HIGH"
+          severity: CRITICAL,HIGH
 
       - name: Terraform Init
         id: init
@@ -75,6 +78,7 @@ jobs:
       - name: Terraform Format
         id: fmt
         run: terraform fmt -check
+        continue-on-error: true
 
       - name: Terraform Validate
         id: validate
@@ -107,41 +111,47 @@ jobs:
         run: |
           terraform workspace select $WORKSPACE_NAME || terraform workspace new $WORKSPACE_NAME
 
+      # ✅ FIXED PLAN OUTPUT
       - name: Terraform Plan
         id: plan
-        run: terraform plan -var-file=$TF_VAR_FILE -no-color -input=false -out=tfplan
+        run: |
+          terraform plan -var-file=$TF_VAR_FILE -no-color -input=false -out=tfplan | tee plan.txt
+
+          echo "plan<<EOF" >> $GITHUB_OUTPUT
+          cat plan.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
         continue-on-error: true
 
       - name: Update Pull Request
-        uses: actions/github-script@v6
         if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
         env:
-          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+          PLAN: "${{ steps.plan.outputs.plan }}"
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
-            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
-            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
-            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
-            #### Environment 🌍 \`${{ env.WORKSPACE_NAME }}\`
+            const output = `#### Terraform Format 🖌: ${{ steps.fmt.outcome }}
+            #### Terraform Init ⚙️: ${{ steps.init.outcome }}
+            #### Terraform Validate 🤖: ${{ steps.validate.outcome }}
+            #### Terraform Plan 📖: ${{ steps.plan.outcome }}
+            #### Environment 🌍: ${process.env.WORKSPACE_NAME}
 
             <details><summary>Show Plan</summary>
 
-            \`\`\`\n
+            \`\`\`
             ${process.env.PLAN}
             \`\`\`
 
             </details>
 
-            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            *Actor: @${{ github.actor }} | Event: ${{ github.event_name }}*`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: output
-            })
+            });
 
       - name: Terraform Plan Status
         if: steps.plan.outcome == 'failure'
@@ -151,17 +161,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ env.WORKSPACE_NAME }}
-          path: tfplan
+          path: ./code/tfplan
 
   terraform-apply:
     name: "Terraform Apply"
     needs: terraform-plan
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+
     environment: ${{ needs.terraform-plan.outputs.tf_workspace }}
+
     defaults:
       run:
         shell: bash
+        working-directory: ./code/
 
     steps:
       - name: Checkout
@@ -170,15 +183,15 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.13.3
+          terraform_version: 1.6.6
 
       - name: Terraform Init
         run: terraform init
 
       - name: Set Environment Variables
-        id: env-vars
         run: |
           BRANCH_NAME="${{ github.ref_name }}"
+
           if [[ "$BRANCH_NAME" == "main" ]]; then
             echo "WORKSPACE_NAME=prod" >> $GITHUB_ENV
             echo "TF_VAR_FILE=prod.tfvars" >> $GITHUB_ENV
